@@ -1,158 +1,51 @@
 import numpy as np
-import torch
+import numpy.linalg as la
+from pytorch3d.io import load_objs_as_meshes
 import scipy as sp
 import heapq
 import copy
 from sklearn.preprocessing import normalize
+import time
 
 OPTIM_VALENCE = 6
 VALENCE_WEIGHT = 1
 
 class Mesh:
-    def __init__(self, path, build_code=False, build_mat=False, manifold=True):
+    def __init__(self, path):
         self.path = path
-        self.vs, self.faces = self.fill_from_file(path)
-        self.compute_face_normals()
-        self.compute_face_center()
-        self.device = 'cpu'
+        mesh = load_objs_as_meshes([path])
+        # self.vs, self.faces = self.fill_from_file(path)
+        self.vs = mesh.verts_packed().numpy()
+        self.faces = mesh.faces_packed().numpy()
+        self.edges = mesh.edges_packed().numpy()
+        self.fn = mesh.faces_normals_packed().numpy()
+        self.fc = np.sum(self.vs[self.faces], 1) / 3.0
+        self.fa = mesh.faces_areas_packed().numpy()
+        self.get_abcd()
+        self.build_v2v()
+        self.build_vf()
         self.simp = False
-        
-        if manifold:
-            self.build_gemm() #self.edges, self.ve
-            self.compute_vert_normals()
-            self.build_v2v()
-            self.build_vf()
-            self.build_uni_lap()
 
-    def fill_from_file(self, path):
-        vs, faces = [], []
-        f = open(path)
-        for line in f:
-            line = line.strip()
-            splitted_line = line.split()
-            if not splitted_line:
-                continue
-            elif splitted_line[0] == 'v':
-                vs.append([float(v) for v in splitted_line[1:4]])
-            elif splitted_line[0] == 'f':
-                face_vertex_ids = [int(c.split('/')[0]) for c in splitted_line[1:]]
-                assert len(face_vertex_ids) == 3
-                face_vertex_ids = [(ind - 1) if (ind >= 0) else (len(vs) + ind) for ind in face_vertex_ids]
-                faces.append(face_vertex_ids)
-        f.close()
-        vs = np.asarray(vs)
-        faces = np.asarray(faces, dtype=int)
+    # def compute_face_normals(self):
+    #     face_normals = np.cross(self.vs[self.faces[:, 1]] - self.vs[self.faces[:, 0]], self.vs[self.faces[:, 2]] - self.vs[self.faces[:, 0]])
+    #     norm = np.linalg.norm(face_normals, axis=1, keepdims=True) + 1e-24
+    #     face_areas = 0.5 * np.sqrt((face_normals**2).sum(axis=1))
+    #     face_normals /= norm
+    #     self.fn, self.fa = face_normals, face_areas
 
-        assert np.logical_and(faces >= 0, faces < len(vs)).all()
-        return vs, faces
+    def get_abcd(self):
+        self.p = self.vs[self.faces[:, 0]]
+        self.e1 = self.vs[self.faces[:, 1]] - self.p
+        self.e1 /= la.norm(self.e1, axis=1, keepdims=True) + 1e-24
 
-    def build_gemm(self):
-        self.ve = [[] for _ in self.vs]
-        self.vei = [[] for _ in self.vs]
-        edge_nb = []
-        sides = []
-        edge2key = dict()
-        edges = []
-        edges_count = 0
-        nb_count = []
-        for face_id, face in enumerate(self.faces):
-            faces_edges = []
-            for i in range(3):
-                cur_edge = (face[i], face[(i + 1) % 3])
-                faces_edges.append(cur_edge)
-            for idx, edge in enumerate(faces_edges):
-                edge = tuple(sorted(list(edge)))
-                faces_edges[idx] = edge
-                if edge not in edge2key:
-                    edge2key[edge] = edges_count
-                    edges.append(list(edge))
-                    edge_nb.append([-1, -1, -1, -1])
-                    sides.append([-1, -1, -1, -1])
-                    self.ve[edge[0]].append(edges_count)
-                    self.ve[edge[1]].append(edges_count)
-                    self.vei[edge[0]].append(0)
-                    self.vei[edge[1]].append(1)
-                    nb_count.append(0)
-                    edges_count += 1
-            for idx, edge in enumerate(faces_edges):
-                edge_key = edge2key[edge]
-                edge_nb[edge_key][nb_count[edge_key]] = edge2key[faces_edges[(idx + 1) % 3]]
-                edge_nb[edge_key][nb_count[edge_key] + 1] = edge2key[faces_edges[(idx + 2) % 3]]
-                nb_count[edge_key] += 2
-            for idx, edge in enumerate(faces_edges):
-                edge_key = edge2key[edge]
-                sides[edge_key][nb_count[edge_key] - 2] = nb_count[edge2key[faces_edges[(idx + 1) % 3]]] - 1
-                sides[edge_key][nb_count[edge_key] - 1] = nb_count[edge2key[faces_edges[(idx + 2) % 3]]] - 2
-        self.edges = np.array(edges, dtype=np.int32)
-        self.gemm_edges = np.array(edge_nb, dtype=np.int64)
-        self.sides = np.array(sides, dtype=np.int64)
-        self.edges_count = edges_count
+        e2 = self.vs[self.faces[:, 2]] - self.p
+        e2_p_e1 = (e2*self.e1).sum(axis=1, keepdims=True)*self.e1
+        self.e2 = e2 - e2_p_e1
+        self.e2 /= la.norm(self.e2, axis=1, keepdims=True) + 1e-24
 
-    def compute_face_normals(self):
-        face_normals = np.cross(self.vs[self.faces[:, 1]] - self.vs[self.faces[:, 0]], self.vs[self.faces[:, 2]] - self.vs[self.faces[:, 0]])
-        norm = np.linalg.norm(face_normals, axis=1, keepdims=True) + 1e-24
-        face_areas = 0.5 * np.sqrt((face_normals**2).sum(axis=1))
-        face_normals /= norm
-        self.fn, self.fa = face_normals, face_areas
+        # d_s = - 1.0 * np.sum(self.fn * self.fc, axis=1, keepdims=True)
+        # self.abcd = np.concatenate([self.fn, d_s], axis=1)
 
-    def compute_vert_normals(self):
-        vert_normals = np.zeros((3, len(self.vs)))
-        face_normals = self.fn
-        faces = self.faces
-
-        nv = len(self.vs)
-        nf = len(faces)
-        mat_rows = faces.reshape(-1)
-        mat_cols = np.array([[i] * 3 for i in range(nf)]).reshape(-1)
-        mat_vals = np.ones(len(mat_rows))
-        f2v_mat = sp.sparse.csr_matrix((mat_vals, (mat_rows, mat_cols)), shape=(nv, nf))
-        vert_normals = sp.sparse.csr_matrix.dot(f2v_mat, face_normals)
-        vert_normals = normalize(vert_normals, norm='l2', axis=1)
-        self.vn = vert_normals
-    
-    def compute_face_center(self):
-        faces = self.faces
-        vs = self.vs
-        self.fc = np.sum(vs[faces], 1) / 3.0
-    
-    def build_uni_lap(self):
-        """compute uniform laplacian matrix"""
-        vs = torch.tensor(self.vs.T, dtype=torch.float)
-        edges = self.edges
-        ve = self.ve
-
-        sub_mesh_vv = [edges[v_e, :].reshape(-1) for v_e in ve]
-        sub_mesh_vv = [set(vv.tolist()).difference(set([i])) for i, vv in enumerate(sub_mesh_vv)]
-
-        num_verts = vs.size(1)
-        mat_rows = [np.array([i] * len(vv), dtype=np.int64) for i, vv in enumerate(sub_mesh_vv)]
-        mat_rows = np.concatenate(mat_rows)
-        mat_cols = [np.array(list(vv), dtype=np.int64) for vv in sub_mesh_vv]
-        mat_cols = np.concatenate(mat_cols)
-
-        mat_rows = torch.from_numpy(mat_rows).long()
-        mat_cols = torch.from_numpy(mat_cols).long()
-        mat_vals = torch.ones_like(mat_rows).float() * -1.0
-        neig_mat = torch.sparse.FloatTensor(torch.stack([mat_rows, mat_cols], dim=0),
-                                            mat_vals,
-                                            size=torch.Size([num_verts, num_verts]))
-        vs = vs.T
-
-        sum_count = torch.sparse.mm(neig_mat, torch.ones((num_verts, 1)).type_as(vs))
-        mat_rows_ident = np.array([i for i in range(num_verts)])
-        mat_cols_ident = np.array([i for i in range(num_verts)])
-        mat_ident = np.array([-s for s in sum_count[:, 0]])
-        mat_rows_ident = torch.from_numpy(mat_rows_ident).long()
-        mat_cols_ident = torch.from_numpy(mat_cols_ident).long()
-        mat_ident = torch.from_numpy(mat_ident).long()
-        mat_rows = torch.cat([mat_rows, mat_rows_ident])
-        mat_cols = torch.cat([mat_cols, mat_cols_ident])
-        mat_vals = torch.cat([mat_vals, mat_ident])
-
-        self.lapmat = torch.sparse.FloatTensor(torch.stack([mat_rows, mat_cols], dim=0),
-                                            mat_vals,
-                                            size=torch.Size([num_verts, num_verts]))
-    
     def build_vf(self):
         vf = [set() for _ in range(len(self.vs))]
         for i, f in enumerate(self.faces):
@@ -168,65 +61,72 @@ class Mesh:
             v2v[e[1]].append(e[0])
         self.v2v = v2v
 
-        """ compute adjacent matrix """
-        edges = self.edges
-        v2v_inds = edges.T
-        v2v_inds = torch.from_numpy(np.concatenate([v2v_inds, v2v_inds[[1, 0]]], axis=1)).long()
-        v2v_vals = torch.ones(v2v_inds.shape[1]).float()
-        self.v2v_mat = torch.sparse.FloatTensor(v2v_inds, v2v_vals, size=torch.Size([len(self.vs), len(self.vs)]))
-        self.v_dims = torch.sum(self.v2v_mat.to_dense(), axis=1)
-
-    def simplification(self, target_v, valence_aware=True, midpoint=False):
-        vs, vf, fn, fc, edges = self.vs, self.vf, self.fn, self.fc, self.edges
+    def simplification(self, target_v):
+        vs, vf, edges = self.vs, self.vf, self.edges
+        ndim = vs.shape[1]
 
         """ 1. compute Q for each vertex """
-        Q_s = [[] for _ in range(len(vs))]
-        E_s = [[] for _ in range(len(vs))]
+        self.A_s = [np.zeros((3,3)) for _ in range(len(vs))]
+        self.B_s = [np.zeros((3,1)) for _ in range(len(vs))]
+        self.C_s = [np.zeros((1,1)) for _ in range(len(vs))]
+        # self.Q_s = [[] for _ in range(len(vs))]
         for i, v in enumerate(vs):
-            f_s = np.array(list(vf[i]))
-            fc_s = fc[f_s]
-            fn_s = fn[f_s]
-            d_s = - 1.0 * np.sum(fn_s * fc_s, axis=1, keepdims=True)
-            abcd_s = np.concatenate([fn_s, d_s], axis=1)
-            Q_s[i] = np.matmul(abcd_s.T, abcd_s)
-            v4 = np.concatenate([v, np.array([1])])
-            E_s[i] = np.matmul(v4, np.matmul(Q_s[i], v4.T))
+            f_s = list(vf[i])
+            for f in f_s:
+                e1, e2, p = self.e1[f][:,None], self.e2[f][:,None], self.p[f][:,None]
+                
+                pe1 = np.sum(p * e1)
+                pe2 = np.sum(p * e2)
+
+                self.A_s[i] += np.eye(ndim)-np.matmul(e1, e1.T)-np.matmul(e2,e2.T)
+                self.B_s[i] += e1*pe1 + e2*pe2 - p
+                self.C_s[i] += np.matmul(p.T, p) - pe1**2 - pe2**2
+
+                # E_a = np.matmul(p.T,np.matmul(A, p)) 
+                # E_b = 2*np.matmul(b.T, v) 
+                # E_c = c
+                # print(E_a + E_b + E_c)
+
+            # e1_s, e2_s, p_s = self.e1[f_s[0:1]], self.e2[f_s[0:1]], self.p[f_s[0:1]]
+            # pe1 = np.sum(p_s * e1_s, axis=1, keepdims=True)
+            # pe2 = np.sum(p_s * e2_s, axis=1, keepdims=True)
+
+            # self.A_s[i] = np.eye(ndim)*len(f_s) - np.matmul(e1_s.T, e1_s) - np.matmul(e2_s.T, e2_s)
+            # self.B_s[i] = np.matmul(e1_s.T, pe1) + np.matmul(e2_s.T, pe2) - np.sum(p_s.T, axis=1, keepdims=True)
+            # self.C_s[i] = np.sum(p_s**2 - pe1**2 - pe2**2)
+
+            # E_a = np.matmul(v.T,np.matmul(self.A_s[i], v)) 
+            # E_b = 2*np.matmul(self.B_s[i].T, v)[0]
+            # E_c = self.C_s[i][0,0]
+
+            # f_s = np.array(list(vf[i]))
+            # abcd_s = self.abcd[f_s]
+            # self.Q_s[i] = np.matmul(abcd_s.T, abcd_s)
+            # v4 = np.concatenate([v, np.array([1])])
+            # E_s = np.matmul(v4, np.matmul(self.Q_s[i], v4.T))
+            
+            # print(E_a+E_b+E_c)
 
         """ 2. compute E for every possible pairs and create heapq """
         E_heap = []
         for i, e in enumerate(edges):
             v_0, v_1 = vs[e[0]], vs[e[1]]
-            Q_0, Q_1 = Q_s[e[0]], Q_s[e[1]]
-            Q_new = Q_0 + Q_1
+            A_new, B_new, C_new = (self.A_s[e[0]]+self.A_s[e[1]]),(self.B_s[e[0]]+self.B_s[e[1]]),(self.C_s[e[0]]+self.C_s[e[1]])
 
-            if midpoint:
-                v_new = 0.5 * (v_0 + v_1)
-                v4_new = np.concatenate([v_new, np.array([1])])
-            else:
-                Q_lp = np.eye(4)
-                Q_lp[:3] = Q_new[:3]
-                try:
-                    Q_lp_inv = np.linalg.inv(Q_lp)
-                    v4_new = np.matmul(Q_lp_inv, np.array([[0,0,0,1]]).reshape(-1,1)).reshape(-1)
-                except:
-                    v_new = 0.5 * (v_0 + v_1)
-                    v4_new = np.concatenate([v_new, np.array([1])])
+            try:
+                v_new = -np.matmul(la.inv(A_new), B_new)
+            except:
+                v_new = (0.5 * (v_0 + v_1))[:,None]
 
-            valence_penalty = 1
-            if valence_aware:
-                merged_faces = vf[e[0]].intersection(vf[e[1]])
-                valence_new = len(vf[e[0]].union(vf[e[1]]).difference(merged_faces))
-                valence_penalty = self.valence_weight(valence_new)
-            
-            
-            E_new = np.matmul(v4_new, np.matmul(Q_new, v4_new.T)) * valence_penalty
-            heapq.heappush(E_heap, (E_new, (e[0], e[1])))
-        
+            # E_new = np.matmul(v_new, B_new)[0] + C_new
+            E_new = np.matmul(v_new.T,np.matmul(A_new, v_new)) + 2*np.matmul(B_new.T, v_new) + C_new
+            # print(E_new)
+            heapq.heappush(E_heap, (E_new[0,0], (e[0], e[1]), v_new[:,0], (A_new, B_new, C_new)))
         """ 3. collapse minimum-error vertex """
         simp_mesh = copy.deepcopy(self)
 
-        vi_mask = np.ones([len(simp_mesh.vs)]).astype(np.bool)
-        fi_mask = np.ones([len(simp_mesh.faces)]).astype(np.bool)
+        vi_mask = np.ones([len(simp_mesh.vs)]).astype(np.bool_)
+        fi_mask = np.ones([len(simp_mesh.faces)]).astype(np.bool_)
 
         vert_map = [{i} for i in range(len(simp_mesh.vs))]
 
@@ -235,63 +135,7 @@ class Mesh:
                 print("[Warning]: edge cannot be collapsed anymore!")
                 break
 
-            E_0, (vi_0, vi_1) = heapq.heappop(E_heap)
-
-            if (vi_mask[vi_0] == False) or (vi_mask[vi_1] == False):
-                continue
-
-            """ edge collapse """
-            shared_vv = list(set(simp_mesh.v2v[vi_0]).intersection(set(simp_mesh.v2v[vi_1])))
-            merged_faces = simp_mesh.vf[vi_0].intersection(simp_mesh.vf[vi_1])
-
-            if len(shared_vv) != 2:
-                """ non-manifold! """
-                # print("non-manifold can be occured!!" , len(shared_vv))
-                self.remove_tri_valance(simp_mesh, vi_0, vi_1, shared_vv, merged_faces, vi_mask, fi_mask, vert_map, Q_s, E_heap)
-                continue
-
-            elif len(merged_faces) != 2:
-                """ boundary """
-                # print("boundary edge cannot be collapsed!")
-                continue
-
-            else:
-                self.edge_collapse(simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, Q_s, E_heap, valence_aware=valence_aware)
-                # print(np.sum(vi_mask), np.sum(fi_mask))
-        
-        self.rebuild_mesh(simp_mesh, vi_mask, fi_mask, vert_map)
-        simp_mesh.simp = True
-        self.build_hash(simp_mesh, vi_mask, vert_map)
-        
-        return simp_mesh
-    
-    def edge_based_simplification(self, target_v, valence_aware=True):
-        vs, vf, fn, fc, edges = self.vs, self.vf, self.fn, self.fc, self.edges
-        edge_len = vs[edges][:,0,:] - vs[edges][:,1,:]
-        edge_len = np.linalg.norm(edge_len, axis=1)
-        edge_len_heap = np.stack([edge_len, np.arange(len(edge_len))], axis=1).tolist()
-        heapq.heapify(edge_len_heap)
-
-        """ 2. compute E for every possible pairs and create heapq """
-        E_heap = []
-        for i, e in enumerate(edges):
-            v_0, v_1 = vs[e[0]], vs[e[1]]
-            heapq.heappush(E_heap, (edge_len[i], (e[0], e[1])))
-        
-        """ 3. collapse minimum-error vertex """
-        simp_mesh = copy.deepcopy(self)
-
-        vi_mask = np.ones([len(simp_mesh.vs)]).astype(np.bool)
-        fi_mask = np.ones([len(simp_mesh.faces)]).astype(np.bool)
-
-        vert_map = [{i} for i in range(len(simp_mesh.vs))]
-
-        while np.sum(vi_mask) > target_v:
-            if len(E_heap) == 0:
-                print("[Warning]: edge cannot be collapsed anymore!")
-                break
-
-            E_0, (vi_0, vi_1) = heapq.heappop(E_heap)
+            E_0, (vi_0, vi_1), v_new, Q_new = heapq.heappop(E_heap)
 
             if (vi_mask[vi_0] == False) or (vi_mask[vi_1] == False):
                 continue
@@ -311,7 +155,7 @@ class Mesh:
                 continue
 
             else:
-                self.edge_based_collapse(simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, E_heap, valence_aware=valence_aware)
+                self.edge_collapse(simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, v_new, Q_new, E_heap)
                 # print(np.sum(vi_mask), np.sum(fi_mask))
         
         self.rebuild_mesh(simp_mesh, vi_mask, fi_mask, vert_map)
@@ -319,13 +163,8 @@ class Mesh:
         self.build_hash(simp_mesh, vi_mask, vert_map)
         
         return simp_mesh
-    
-    @staticmethod
-    def remove_tri_valance(simp_mesh, vi_0, vi_1, shared_vv, merged_faces, vi_mask, fi_mask, vert_map, Q_s, E_heap):
-        #import pdb;pdb.set_trace()
-        pass  
-    
-    def edge_collapse(self, simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, Q_s, E_heap, valence_aware):
+
+    def edge_collapse(self, simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, v_new, Q_new, E_heap):
         shared_vv = list(set(simp_mesh.v2v[vi_0]).intersection(set(simp_mesh.v2v[vi_1])))
         new_vi_0 = set(simp_mesh.v2v[vi_0]).union(set(simp_mesh.v2v[vi_1])).difference({vi_0, vi_1})
         simp_mesh.vf[vi_0] = simp_mesh.vf[vi_0].union(simp_mesh.vf[vi_1]).difference(merged_faces)
@@ -344,70 +183,24 @@ class Mesh:
         vert_map[vi_0] = vert_map[vi_0].union({vi_1})
         vert_map[vi_1] = set()
         
-        fi_mask[np.array(list(merged_faces)).astype(np.int)] = False
+        fi_mask[np.array(list(merged_faces)).astype(np.int64)] = False
 
-        simp_mesh.vs[vi_0] = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vi_1])
-
-        """ recompute E """
-        Q_0 = Q_s[vi_0]
-        for vv_i in simp_mesh.v2v[vi_0]:
-            v_mid = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vv_i])
-            Q_1 = Q_s[vv_i]
-            Q_new = Q_0 + Q_1
-            v4_mid = np.concatenate([v_mid, np.array([1])])
-
-            valence_penalty = 1
-            if valence_aware:
-                merged_faces = simp_mesh.vf[vi_0].intersection(simp_mesh.vf[vv_i])
-                valence_new = len(simp_mesh.vf[vi_0].union(simp_mesh.vf[vv_i]).difference(merged_faces))
-                valence_penalty = self.valence_weight(valence_new)
-
-            E_new = np.matmul(v4_mid, np.matmul(Q_new, v4_mid.T)) * valence_penalty
-            heapq.heappush(E_heap, (E_new, (vi_0, vv_i)))
-
-    def edge_based_collapse(self, simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, E_heap, valence_aware):
-        shared_vv = list(set(simp_mesh.v2v[vi_0]).intersection(set(simp_mesh.v2v[vi_1])))
-        new_vi_0 = set(simp_mesh.v2v[vi_0]).union(set(simp_mesh.v2v[vi_1])).difference({vi_0, vi_1})
-        simp_mesh.vf[vi_0] = simp_mesh.vf[vi_0].union(simp_mesh.vf[vi_1]).difference(merged_faces)
-        simp_mesh.vf[vi_1] = set()
-        simp_mesh.vf[shared_vv[0]] = simp_mesh.vf[shared_vv[0]].difference(merged_faces)
-        simp_mesh.vf[shared_vv[1]] = simp_mesh.vf[shared_vv[1]].difference(merged_faces)
-
-        simp_mesh.v2v[vi_0] = list(new_vi_0)
-        for v in simp_mesh.v2v[vi_1]:
-            if v != vi_0:
-                simp_mesh.v2v[v] = list(set(simp_mesh.v2v[v]).difference({vi_1}).union({vi_0}))
-        simp_mesh.v2v[vi_1] = []
-        vi_mask[vi_1] = False
-
-        vert_map[vi_0] = vert_map[vi_0].union(vert_map[vi_1])
-        vert_map[vi_0] = vert_map[vi_0].union({vi_1})
-        vert_map[vi_1] = set()
-        
-        fi_mask[np.array(list(merged_faces)).astype(np.int)] = False
-
-        simp_mesh.vs[vi_0] = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vi_1])
+        # simp_mesh.vs[vi_0] = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vi_1])
+        simp_mesh.vs[vi_0] = v_new
+        self.A_s[vi_0], self.B_s[vi_0], self.C_s[vi_0] = Q_new
 
         """ recompute E """
         for vv_i in simp_mesh.v2v[vi_0]:
-            v_mid = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vv_i])
-            edge_len = np.linalg.norm(simp_mesh.vs[vi_0] - simp_mesh.vs[vv_i])
-            valence_penalty = 1
-            if valence_aware:
-                merged_faces = simp_mesh.vf[vi_0].intersection(simp_mesh.vf[vv_i])
-                valence_new = len(simp_mesh.vf[vi_0].union(simp_mesh.vf[vv_i]).difference(merged_faces))
-                valence_penalty = self.valence_weight(valence_new)
-                edge_len *= valence_penalty
+            A_new, B_new, C_new = (self.A_s[vi_0]+self.A_s[vv_i]),(self.B_s[vi_0]+self.B_s[vv_i]),(self.C_s[vi_0]+self.C_s[vv_i])
+            # v_mid = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vv_i])[:,None]
+            try:
+                v_mid = -np.matmul(la.inv(A_new), B_new).reshape(-1)
+            except:
+                v_mid = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vv_i])[:,None]
 
-            heapq.heappush(E_heap, (edge_len, (vi_0, vv_i)))
+            E_new = np.matmul(v_mid.T,np.matmul(A_new, v_mid)) + 2*np.matmul(B_new.T, v_mid) + C_new
+            heapq.heappush(E_heap, (E_new[0,0], (vi_0, vv_i), v_mid, (A_new, B_new, C_new)))
 
-    @staticmethod
-    def valence_weight(valence_new):
-        valence_penalty = abs(valence_new - OPTIM_VALENCE) * VALENCE_WEIGHT + 1
-        if valence_new == 3:
-            valence_penalty *= 100000
-        return valence_penalty      
-    
     @staticmethod
     def rebuild_mesh(simp_mesh, vi_mask, fi_mask, vert_map):
         face_map = dict(zip(np.arange(len(vi_mask)), np.cumsum(vi_mask)-1))
@@ -428,12 +221,12 @@ class Mesh:
             for j in range(3):
                 simp_mesh.faces[i][j] = face_map[f[j]]
         
-        simp_mesh.compute_face_normals()
-        simp_mesh.compute_face_center()
-        simp_mesh.build_gemm()
-        simp_mesh.compute_vert_normals()
-        simp_mesh.build_v2v()
-        simp_mesh.build_vf()
+        # simp_mesh.compute_face_normals()
+        # simp_mesh.compute_face_center()
+        # simp_mesh.build_gemm()
+        # simp_mesh.compute_vert_normals()
+        # simp_mesh.build_v2v()
+        # simp_mesh.build_vf()
 
     @staticmethod
     def build_hash(simp_mesh, vi_mask, vert_map):
@@ -479,176 +272,3 @@ class Mesh:
                 i1 = indices[i + 1] + 1
                 i2 = indices[i + 2] + 1
                 fp.write('f {0} {1} {2}\n'.format(i0, i1, i2))
-    
-    def save_as_ply(self, filename, fn):
-        assert len(self.vs) > 0
-        vertices = np.array(self.vs, dtype=np.float32).flatten()
-        indices = np.array(self.faces, dtype=np.uint32).flatten()
-        fnormals = np.array(fn, dtype=np.float32).flatten()
-
-        with open(filename, 'w') as fp:
-            # Write Header
-            fp.write("ply\nformat ascii 1.0\nelement vertex {}\n".format(len(self.vs)))
-            fp.write("property float x\nproperty float y\nproperty float z\n")
-            fp.write("element face {}\n".format(len(self.faces)))
-            fp.write("property list uchar int vertex_indices\n")
-            fp.write("property uchar red\nproperty uchar green\nproperty uchar blue\nproperty uchar alpha\n")
-            fp.write("end_header\n")
-            for i in range(0, vertices.size, 3):
-                x = vertices[i + 0]
-                y = vertices[i + 1]
-                z = vertices[i + 2]
-                fp.write("{0:.6f} {1:.6f} {2:.6f}\n".format(x, y, z))
-            
-            for i in range(0, len(indices), 3):
-                i0 = indices[i + 0]
-                i1 = indices[i + 1]
-                i2 = indices[i + 2]
-                c0 = fnormals[i + 0]
-                c1 = fnormals[i + 1]
-                c2 = fnormals[i + 2]
-                c0 = np.clip(int(255 * c0), 0, 255)
-                c1 = np.clip(int(255 * c1), 0, 255)
-                c2 = np.clip(int(255 * c2), 0, 255)
-                c3 = 255
-                fp.write("3 {0} {1} {2} {3} {4} {5} {6}\n".format(i0, i1, i2, c0, c1, c2, c3))
-
-    """ ---------- we don't use functions below ---------- """
-    
-    def pool_main(self, target_v):
-        vs, vf, fn, fc, edges = self.vs, self.vf, self.fn, self.fc, self.edges
-
-        """ 1. compute Q for each vertex """
-        Q_s = [[] for _ in range(len(vs))]
-        E_s = [[] for _ in range(len(vs))]
-        for i, v in enumerate(vs):
-            f_s = np.array(list(vf[i]))
-            fc_s = fc[f_s]
-            fn_s = fn[f_s]
-            d_s = - 1.0 * np.sum(fn_s * fc_s, axis=1, keepdims=True)
-            abcd_s = np.concatenate([fn_s, d_s], axis=1)
-            Q_s[i] = np.matmul(abcd_s.T, abcd_s)
-
-            v4 = np.concatenate([v, np.array([1])])
-            E_s[i] = np.matmul(v4, np.matmul(Q_s[i], v4.T))
-
-        """ 2. compute E for every possible pairs and create heapq """
-        E_heap = []
-        for i, e in enumerate(edges):
-            v_0, v_1 = vs[e[0]], vs[e[1]]
-            v_new = 0.5 * (v_0 + v_1)
-            v4_new = np.concatenate([v_new, np.array([1])])
-            
-            Q_0, Q_1 = Q_s[e[0]], Q_s[e[1]]
-            Q_new = Q_0 + Q_1
-            E_new = np.matmul(v4_new, np.matmul(Q_new, v4_new.T))
-            heapq.heappush(E_heap, (E_new, i))
-        
-        """ 3. collapse minimum-error vertex """
-
-        mask = np.ones(self.edges_count, dtype=np.bool)
-        self.v_mask = np.ones(len(self.vs), dtype=np.bool)
-        while np.sum(self.v_mask) > target_v:
-            E_0, edge_id = heapq.heappop(E_heap)
-            edge = self.edges[edge_id]
-            v_a = self.vs[edge[0]]
-            v_b = self.vs[edge[1]]
-
-            if mask[edge_id]:
-                pool = self.pool_edge(edge_id, mask)
-                if pool:
-                    Q_0 = Q_s[edge[0]]
-                    print(np.sum(self.v_mask), np.sum(mask))
-
-                    """ recompute E """
-                    for vv_i in self.v2v[edge[0]]:
-                        Q_1 = Q_s[vv_i]
-                        Q_new = Q_0 + Q_1
-                        v4_mid = np.concatenate([self.vs[edge[0]], np.array([1])])
-                        E_new = np.matmul(v4_mid, np.matmul(Q_new, v4_mid.T))
-                        heapq.heappush(E_heap, (E_new, edge_id))
-        self.clean(mask)
-
-    def pool_edge(self, edge_id, mask):
-        if self.has_boundaries(edge_id):
-            return False
-        elif self.is_one_ring_valid(edge_id):
-            self.merge_vertices(edge_id)
-            mask[edge_id] = False
-            self.edges_count -= 1
-            return True
-        else:
-            return False
-
-    def merge_vertices(self, edge_id):
-        self.remove_edge(edge_id)
-        edge = self.edges[edge_id]
-        v_a = self.vs[edge[0]]
-        v_b = self.vs[edge[1]]
-        self.vs[edge[0]] = 0.5 * (v_a + v_b)
-        self.v_mask[edge[1]] = False
-        mask = self.edges == edge[1]
-        self.ve[edge[0]].extend(self.ve[edge[1]])
-        self.edges[mask] = edge[0]
-
-    def remove_edge(self, edge_id):
-        vs = self.edges[edge_id]
-        for v in vs:
-            self.ve[v].remove(edge_id)
-    
-    def clean(self, edges_mask):
-        self.gemm_edges = self.gemm_edges[edges_mask]
-        self.edges = self.edges[edges_mask]
-        self.sides = self.sides[edges_mask]
-        new_ve = []
-        edges_mask = np.concatenate([edges_mask, [False]])
-        new_indices = np.zeros(edges_mask.shape[0], dtype=np.int32)
-        new_indices[-1] = -1
-        new_indices[edges_mask] = np.arange(0, np.ma.where(edges_mask)[0].shape[0])
-        self.gemm_edges[:, :] = new_indices[self.gemm_edges[:, :]]
-        for v_index, ve in enumerate(self.ve):
-            update_ve = []
-            # if self.v_mask[v_index]:
-            for e in ve:
-                update_ve.append(new_indices[e])
-            new_ve.append(update_ve)
-        self.ve = new_ve
-
-    def has_boundaries(self, edge_id):
-        for edge in self.gemm_edges[edge_id]:
-            if edge == -1 or -1 in self.gemm_edges[edge]:
-                print(edge_id, "is boundary")
-                return True
-        return False
-
-    def is_one_ring_valid(self, edge_id):
-        v_a = set(self.edges[self.ve[self.edges[edge_id, 0]]].reshape(-1))
-        v_b = set(self.edges[self.ve[self.edges[edge_id, 1]]].reshape(-1))
-        shared = v_a.intersection(v_b).difference(set(self.edges[edge_id]))
-        return len(shared) == 2
-
-    def __get_cycle(self, gemm, edge_id):
-        cycles = []
-        for j in range(2):
-            next_side = start_point = j * 2
-            next_key = edge_id
-            if gemm[edge_id, start_point] == -1:
-                continue
-            cycles.append([])
-            for i in range(3):
-                tmp_next_key = gemm[next_key, next_side]
-                tmp_next_side = self.sides[next_key, next_side]
-                tmp_next_side = tmp_next_side + 1 - 2 * (tmp_next_side % 2)
-                gemm[next_key, next_side] = -1
-                gemm[next_key, next_side + 1 - 2 * (next_side % 2)] = -1
-                next_key = tmp_next_key
-                next_side = tmp_next_side
-                cycles[-1].append(next_key)
-        return cycles
-
-    def __cycle_to_face(self, cycle, v_indices):
-        face = []
-        for i in range(3):
-            v = list(set(self.edges[cycle[i]]) & set(self.edges[cycle[(i + 1) % 3]]))[0]
-            face.append(v_indices[v])
-        return face
