@@ -1,50 +1,68 @@
+import torch
 import numpy as np
 import numpy.linalg as la
-from pytorch3d.io import load_objs_as_meshes
-import scipy as sp
+from pytorch3d.io import load_objs_as_meshes, save_obj
+from pytorch3d.renderer import TexturesUV
 import heapq
 import copy
-from sklearn.preprocessing import normalize
-import time
+
 
 OPTIM_VALENCE = 6
 VALENCE_WEIGHT = 1
 
 class Mesh:
-    def __init__(self, path):
+    def __init__(self, path, boundary_weight=100):
         self.path = path
         mesh = load_objs_as_meshes([path])
-        # self.vs, self.faces = self.fill_from_file(path)
-        self.vs = mesh.verts_packed().numpy()
-        self.faces = mesh.faces_packed().numpy()
+        textures = mesh.textures
+
+        verts = mesh.verts_packed().numpy()
+        faces = mesh.faces_packed().numpy()
+
+        ft = textures.faces_uvs_padded().numpy()[0,:,:]
+        vt = textures.verts_uvs_padded().numpy()[0,:,:]
+        self.texture_map = textures.maps_padded()[0]
+
+        self.clean_mesh(faces, verts, ft, vt)
+        
+        self.verts = verts
+        self.vn = mesh.verts_normals_packed()
+        self.vs = np.concatenate([self.verts, self.vn], axis=1)
+        self.faces = faces
         self.edges = mesh.edges_packed().numpy()
-        self.fn = mesh.faces_normals_packed().numpy()
-        self.fc = np.sum(self.vs[self.faces], 1) / 3.0
-        self.fa = mesh.faces_areas_packed().numpy()
-        self.get_abcd()
+        ndim = self.vs.shape[1]
+
+        self.A_s = [np.zeros((ndim,ndim)) for _ in range(len(self.vs))]
+        self.B_s = [np.zeros((ndim,1)) for _ in range(len(self.vs))]
+        self.C_s = [np.zeros((1,1)) for _ in range(len(self.vs))]
+
         self.build_v2v()
         self.build_vf()
+        self.get_abcd()
+        self.build_boundary_quadratics(boundary_weight)
         self.simp = False
 
-    # def compute_face_normals(self):
-    #     face_normals = np.cross(self.vs[self.faces[:, 1]] - self.vs[self.faces[:, 0]], self.vs[self.faces[:, 2]] - self.vs[self.faces[:, 0]])
-    #     norm = np.linalg.norm(face_normals, axis=1, keepdims=True) + 1e-24
-    #     face_areas = 0.5 * np.sqrt((face_normals**2).sum(axis=1))
-    #     face_normals /= norm
-    #     self.fn, self.fa = face_normals, face_areas
+    def clean_mesh(self, faces, verts, ft, vt):
+        fvt = np.stack([faces,ft], axis=-1).reshape(-1, 2)
+        fvs = np.concatenate([verts[faces], vt[ft]], axis=-1).reshape(fvt.shape[0], -1)
 
-    def get_abcd(self):
-        self.p = self.vs[self.faces[:, 0]]
-        self.e1 = self.vs[self.faces[:, 1]] - self.p
-        self.e1 /= la.norm(self.e1, axis=1, keepdims=True) + 1e-24
-
-        e2 = self.vs[self.faces[:, 2]] - self.p
-        e2_p_e1 = (e2*self.e1).sum(axis=1, keepdims=True)*self.e1
-        self.e2 = e2 - e2_p_e1
-        self.e2 /= la.norm(self.e2, axis=1, keepdims=True) + 1e-24
-
-        # d_s = - 1.0 * np.sum(self.fn * self.fc, axis=1, keepdims=True)
-        # self.abcd = np.concatenate([self.fn, d_s], axis=1)
+        unique_pairs, indx, inv = np.unique(fvt, axis=0, return_index=True, return_inverse=True)
+        self.faces = inv.reshape(faces.shape)
+        self.vs = fvs[indx]
+        
+        self.vert_mapping = [[] for _ in range(len(verts))]
+        for i,new_vs in enumerate(unique_pairs[:,0]):
+            self.vert_mapping[new_vs].append(i)
+        
+        edges, e2k, ec = [], {}, 0
+        for f in self.faces:
+            for i in range(3):
+                e = tuple(sorted([f[i], f[(i+1)%3]]))
+                if e not in e2k:
+                    e2k[e] = ec
+                    ec+=1
+                    edges.append(list(e))
+        self.edges = self.edges = np.array(edges, dtype=np.int64)
 
     def build_vf(self):
         vf = [set() for _ in range(len(self.vs))]
@@ -61,15 +79,44 @@ class Mesh:
             v2v[e[1]].append(e[0])
         self.v2v = v2v
 
+    def get_abcd(self):
+        self.p = self.vs[self.faces[:, 0]]
+        self.e1 = self.vs[self.faces[:, 1]] - self.p
+        self.e1 /= la.norm(self.e1, axis=1, keepdims=True) + 1e-24
+
+        e2 = self.vs[self.faces[:, 2]] - self.p
+        e2_p_e1 = (e2*self.e1).sum(axis=1, keepdims=True)*self.e1
+        self.e2 = e2 - e2_p_e1
+        self.e2 /= la.norm(self.e2, axis=1, keepdims=True) + 1e-24
+
+    def build_boundary_quadratics(self, boundary_weight=100):
+        ef = [[] for _ in range(len(self.edges))]
+        boundary_edge_count = 0
+        for i, (v0,v1) in enumerate(self.edges):
+            ef[i] = self.vf[v0].intersection(self.vf[v1])
+            if len(ef[i])==1:
+                boundary_edge_count += 1
+                f = self.faces[ef[i].pop()]
+                v2 = (set(f).difference(set([v0,v1]))).pop()
+                p,q,r = self.vs[v0], self.vs[v1], self.vs[v2]
+                n = (r-p) - ((r-p)*(q-p)).sum()*(q-p)/la.norm(q-p)**2
+                n /= la.norm(n)
+                pn = (p*n).sum()
+                A = boundary_weight*np.matmul(n[:,None],n[:,None].T)
+                B = -boundary_weight*pn*n[:,None]
+                C = boundary_weight*pn**2
+                self.A_s[v0] += A
+                self.A_s[v1] += A
+                self.B_s[v0] += B
+                self.B_s[v1] += B
+                self.C_s[v0] += C
+                self.C_s[v1] += C
+                
     def simplification(self, target_v):
         vs, vf, edges = self.vs, self.vf, self.edges
         ndim = vs.shape[1]
 
         """ 1. compute Q for each vertex """
-        self.A_s = [np.zeros((3,3)) for _ in range(len(vs))]
-        self.B_s = [np.zeros((3,1)) for _ in range(len(vs))]
-        self.C_s = [np.zeros((1,1)) for _ in range(len(vs))]
-        # self.Q_s = [[] for _ in range(len(vs))]
         for i, v in enumerate(vs):
             f_s = list(vf[i])
             for f in f_s:
@@ -81,48 +128,25 @@ class Mesh:
                 self.A_s[i] += np.eye(ndim)-np.matmul(e1, e1.T)-np.matmul(e2,e2.T)
                 self.B_s[i] += e1*pe1 + e2*pe2 - p
                 self.C_s[i] += np.matmul(p.T, p) - pe1**2 - pe2**2
-
-                # E_a = np.matmul(p.T,np.matmul(A, p)) 
-                # E_b = 2*np.matmul(b.T, v) 
-                # E_c = c
-                # print(E_a + E_b + E_c)
-
-            # e1_s, e2_s, p_s = self.e1[f_s[0:1]], self.e2[f_s[0:1]], self.p[f_s[0:1]]
-            # pe1 = np.sum(p_s * e1_s, axis=1, keepdims=True)
-            # pe2 = np.sum(p_s * e2_s, axis=1, keepdims=True)
-
-            # self.A_s[i] = np.eye(ndim)*len(f_s) - np.matmul(e1_s.T, e1_s) - np.matmul(e2_s.T, e2_s)
-            # self.B_s[i] = np.matmul(e1_s.T, pe1) + np.matmul(e2_s.T, pe2) - np.sum(p_s.T, axis=1, keepdims=True)
-            # self.C_s[i] = np.sum(p_s**2 - pe1**2 - pe2**2)
-
-            # E_a = np.matmul(v.T,np.matmul(self.A_s[i], v)) 
-            # E_b = 2*np.matmul(self.B_s[i].T, v)[0]
-            # E_c = self.C_s[i][0,0]
-
-            # f_s = np.array(list(vf[i]))
-            # abcd_s = self.abcd[f_s]
-            # self.Q_s[i] = np.matmul(abcd_s.T, abcd_s)
-            # v4 = np.concatenate([v, np.array([1])])
-            # E_s = np.matmul(v4, np.matmul(self.Q_s[i], v4.T))
-            
-            # print(E_a+E_b+E_c)
-
+            # E = np.matmul(v.T,np.matmul(self.A_s[i], v)) + 2*np.matmul(self.B_s[i].T, v) + self.C_s[i]
         """ 2. compute E for every possible pairs and create heapq """
         E_heap = []
+        inv_exists = 0
         for i, e in enumerate(edges):
             v_0, v_1 = vs[e[0]], vs[e[1]]
             A_new, B_new, C_new = (self.A_s[e[0]]+self.A_s[e[1]]),(self.B_s[e[0]]+self.B_s[e[1]]),(self.C_s[e[0]]+self.C_s[e[1]])
 
             try:
                 v_new = -np.matmul(la.inv(A_new), B_new)
+                inv_exists += 1
             except:
                 v_new = (0.5 * (v_0 + v_1))[:,None]
 
-            # E_new = np.matmul(v_new, B_new)[0] + C_new
             E_new = np.matmul(v_new.T,np.matmul(A_new, v_new)) + 2*np.matmul(B_new.T, v_new) + C_new
-            # print(E_new)
             heapq.heappush(E_heap, (E_new[0,0], (e[0], e[1]), v_new[:,0], (A_new, B_new, C_new)))
+        
         """ 3. collapse minimum-error vertex """
+        print(f'Inverse exists for {inv_exists} edges out of {i+1}')
         simp_mesh = copy.deepcopy(self)
 
         vi_mask = np.ones([len(simp_mesh.vs)]).astype(np.bool_)
@@ -151,11 +175,14 @@ class Mesh:
 
             elif len(merged_faces) != 2:
                 """ boundary """
+                print('got boundary')
                 # print("boundary edge cannot be collapsed!")
                 continue
 
             else:
-                self.edge_collapse(simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, v_new, Q_new, E_heap)
+                simp_mesh.vs[vi_0] = v_new
+                simp_mesh.A_s[vi_0], simp_mesh.B_s[vi_0], simp_mesh.C_s[vi_0] = Q_new
+                self.edge_collapse(simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, E_heap)
                 # print(np.sum(vi_mask), np.sum(fi_mask))
         
         self.rebuild_mesh(simp_mesh, vi_mask, fi_mask, vert_map)
@@ -164,7 +191,7 @@ class Mesh:
         
         return simp_mesh
 
-    def edge_collapse(self, simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, v_new, Q_new, E_heap):
+    def edge_collapse(self, simp_mesh, vi_0, vi_1, merged_faces, vi_mask, fi_mask, vert_map, E_heap):
         shared_vv = list(set(simp_mesh.v2v[vi_0]).intersection(set(simp_mesh.v2v[vi_1])))
         new_vi_0 = set(simp_mesh.v2v[vi_0]).union(set(simp_mesh.v2v[vi_1])).difference({vi_0, vi_1})
         simp_mesh.vf[vi_0] = simp_mesh.vf[vi_0].union(simp_mesh.vf[vi_1]).difference(merged_faces)
@@ -185,14 +212,11 @@ class Mesh:
         
         fi_mask[np.array(list(merged_faces)).astype(np.int64)] = False
 
-        # simp_mesh.vs[vi_0] = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vi_1])
-        simp_mesh.vs[vi_0] = v_new
-        self.A_s[vi_0], self.B_s[vi_0], self.C_s[vi_0] = Q_new
-
         """ recompute E """
         for vv_i in simp_mesh.v2v[vi_0]:
-            A_new, B_new, C_new = (self.A_s[vi_0]+self.A_s[vv_i]),(self.B_s[vi_0]+self.B_s[vv_i]),(self.C_s[vi_0]+self.C_s[vv_i])
-            # v_mid = 0.5 * (simp_mesh.vs[vi_0] + simp_mesh.vs[vv_i])[:,None]
+            A_new = (simp_mesh.A_s[vi_0]+simp_mesh.A_s[vv_i])
+            B_new = (simp_mesh.B_s[vi_0]+simp_mesh.B_s[vv_i])
+            C_new = (simp_mesh.C_s[vi_0]+simp_mesh.C_s[vv_i])
             try:
                 v_mid = -np.matmul(la.inv(A_new), B_new).reshape(-1)
             except:
@@ -203,13 +227,27 @@ class Mesh:
 
     @staticmethod
     def rebuild_mesh(simp_mesh, vi_mask, fi_mask, vert_map):
-        face_map = dict(zip(np.arange(len(vi_mask)), np.cumsum(vi_mask)-1))
-        simp_mesh.vs = simp_mesh.vs[vi_mask]
-        
         vert_dict = {}
         for i, vm in enumerate(vert_map):
             for j in vm:
                 vert_dict[j] = i
+        
+        simp_mesh.verts = simp_mesh.vs[:,:3]
+        # simp_mesh.vt = simp_mesh.vs[:,3:5]
+
+        # for vmap in simp_mesh.vert_mapping:
+        #     v_corrected = np.zeros(3)
+        #     c=0
+        #     for v in vmap:
+        #         v_corrected += simp_mesh.verts[vert_dict[v]]
+        #         c+=1
+        #     for v in vmap:
+        #         simp_mesh.verts[vert_dict[v]] = v_corrected
+
+        face_map = dict(zip(np.arange(len(vi_mask)), np.cumsum(vi_mask)-1))
+        simp_mesh.verts = simp_mesh.verts[vi_mask]
+        # simp_mesh.vt = simp_mesh.vt[vi_mask]
+        simp_mesh.vs = simp_mesh.vs[vi_mask]
 
         for i, f in enumerate(simp_mesh.faces):
             for j in range(3):
@@ -220,13 +258,6 @@ class Mesh:
         for i, f in enumerate(simp_mesh.faces):
             for j in range(3):
                 simp_mesh.faces[i][j] = face_map[f[j]]
-        
-        # simp_mesh.compute_face_normals()
-        # simp_mesh.compute_face_center()
-        # simp_mesh.build_gemm()
-        # simp_mesh.compute_vert_normals()
-        # simp_mesh.build_v2v()
-        # simp_mesh.build_vf()
 
     @staticmethod
     def build_hash(simp_mesh, vi_mask, vert_map):
@@ -253,9 +284,17 @@ class Mesh:
         simp_mesh.pool_hash = pool_hash
         simp_mesh.unpool_hash = unpool_hash
             
+    def save_(self,filename):
+        vertices = torch.tensor(self.verts)
+        verts_uvs = torch.tensor(self.vt.clip(0.,1.))
+        faces = torch.tensor(self.faces)
+        faces_uvs = torch.tensor(self.faces)
+        save_obj(filename, verts=vertices, faces=faces, verts_uvs=verts_uvs, faces_uvs=faces_uvs, texture_map=self.texture_map)
+    
     def save(self, filename):
         assert len(self.vs) > 0
-        vertices = np.array(self.vs, dtype=np.float32).flatten()
+        vertices = np.array(self.verts, dtype=np.float32).flatten()
+        # vt = np.array(self.vt, dtype=np.float32).flatten().clip(0., 1.)
         indices = np.array(self.faces, dtype=np.uint32).flatten()
 
         with open(filename, 'w') as fp:
@@ -266,9 +305,14 @@ class Mesh:
                 z = vertices[i + 2]
                 fp.write('v {0:.8f} {1:.8f} {2:.8f}\n'.format(x, y, z))
 
+            # for i in range(0, vt.size, 2):
+            #     u = vertices[i + 0]
+            #     v = vertices[i + 1]
+            #     fp.write('vt {0:.8f} {1:.8f} {2:.8f}\n'.format(u, v))
+
             # Write indices
             for i in range(0, len(indices), 3):
                 i0 = indices[i + 0] + 1
                 i1 = indices[i + 1] + 1
                 i2 = indices[i + 2] + 1
-                fp.write('f {0} {1} {2}\n'.format(i0, i1, i2))
+                fp.write('f {0}/{0} {1}/{1} {2}/{2}\n'.format(i0, i1, i2))
